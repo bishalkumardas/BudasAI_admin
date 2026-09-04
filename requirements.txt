@@ -1,0 +1,6 @@
+streamlit>=1.57
+supabase>=2.0
+yfinance>=0.2.54
+pandas>=2.0
+requests>=2.31
+streamlit-cookies-controller>=0.0.4

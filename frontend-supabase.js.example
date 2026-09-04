@@ -1,0 +1,38 @@
+// Install: npm install @supabase/supabase-js
+// In Vite, set VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY.
+// Never put the dashboard's secret/service-role key in this file.
+import { createClient } from "@supabase/supabase-js";
+
+export const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+);
+
+export async function getMarketHistory(marketId, from, to) {
+  const { data, error } = await supabase
+    .from("market_history")
+    .select("timestamp, open, high, low, close, volume")
+    .eq("market_id", marketId)
+    .gte("timestamp", from)
+    .lte("timestamp", to)
+    .order("timestamp", { ascending: true });
+  if (error) throw error;
+  return data;
+}
+
+export async function getPublishedArticle(slug) {
+  const { data, error } = await supabase
+    .from("research_articles")
+    .select("id, title, slug, body_html, published_at")
+    .eq("slug", slug)
+    .not("published_at", "is", null)
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+// React example:
+// const article = await getPublishedArticle("weekly-outlook");
+// <div dangerouslySetInnerHTML={{ __html: article.body_html }} />
+// Sanitize body_html with DOMPurify before rendering if anyone outside your
+// trusted admin team can author it.
