@@ -526,9 +526,15 @@ elif page=="Daily News":
 
         try:
             with st.spinner("Refreshing Daily News..."):
-                today_start = datetime.combine(date.today(), datetime.min.time(), tzinfo=timezone.utc)
+                today = datetime.now(timezone.utc).date()
+                today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+                tomorrow_start = today_start + timedelta(days=1)
                 existing = db().table("daily_news").select(
                     "id", count="exact"
+                ).gte(
+                    "created_at", today_start.isoformat()
+                ).lt(
+                    "created_at", tomorrow_start.isoformat()
                 ).execute()
                 existing_count = existing.count or len(existing.data or [])
 
