@@ -34,60 +34,141 @@ def safe_error_details(error_text, api_key):
     return str(error_text).replace(api_key, "[REDACTED]")
 
 def fetch_daily_news(api_key):
-    for attempt in range(3):
-        try:
-            response = requests.get(
-                "https://api.finnhub.io/api/v1/news",
-                params={"category": "general", "token": api_key},
-                headers={"Accept": "application/json", "User-Agent": "BudasAI Admin"},
-                timeout=(5, 20),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            break
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-            if attempt == 2:
-                raise
-    else:
-        raise RuntimeError("Finnhub request failed after retries.")
-
-    if not isinstance(payload, list):
-        raise ValueError("Finnhub returned an unexpected response; expected a list of news articles.")
-
+    categories = ("general", "forex", "crypto", "merger")
     records = []
-    for article in payload:
-        if not isinstance(article, dict):
-            continue
-        headline = article.get("headline")
-        article_url = article.get("url")
-        if not isinstance(headline, str) or not headline.strip():
-            continue
-        if not isinstance(article_url, str) or not article_url.strip():
-            continue
 
-        published_at = None
-        timestamp = article.get("datetime")
-        if timestamp is not None:
+    for category in categories:
+        for attempt in range(3):
             try:
-                published_at = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).isoformat()
-            except (TypeError, ValueError, OverflowError, OSError):
-                pass
+                response = requests.get(
+                    "https://api.finnhub.io/api/v1/news",
+                    params={"category": category, "token": api_key},
+                    headers={"Accept": "application/json", "User-Agent": "BudasAI Admin"},
+                    timeout=(5, 20),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                if attempt == 2:
+                    raise
+        else:
+            raise RuntimeError(f"Finnhub {category} news request failed after retries.")
 
-        record = {
-            "category": article.get("category"),
-            "published_at": published_at,
-            "headline": headline.strip(),
-            "image_url": article.get("image"),
-            "related": article.get("related"),
-            "source": article.get("source"),
-            "summary": article.get("summary"),
-            "article_url": article_url.strip(),
-        }
-        if article.get("id") is not None:
-            record["finnhub_id"] = article["id"]
-        records.append(record)
+        if not isinstance(payload, list):
+            raise ValueError(f"Finnhub returned an unexpected {category} news response; expected a list.")
+
+        for article in payload:
+            if not isinstance(article, dict):
+                continue
+            headline = article.get("headline")
+            article_url = article.get("url")
+            if not isinstance(headline, str) or not headline.strip():
+                continue
+            if not isinstance(article_url, str) or not article_url.strip():
+                continue
+
+            published_at = None
+            timestamp = article.get("datetime")
+            if timestamp is not None:
+                try:
+                    published_at = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    pass
+
+            record = {
+                "category": article.get("category") or category,
+                "published_at": published_at,
+                "headline": headline.strip(),
+                "image_url": article.get("image"),
+                "related": article.get("related"),
+                "source": article.get("source"),
+                "summary": article.get("summary"),
+                "article_url": article_url.strip(),
+            }
+            if article.get("id") is not None:
+                record["finnhub_id"] = article["id"]
+            records.append(record)
 
     return records
+
+def existing_daily_news_ids():
+    page_size = 1000
+    offset = 0
+    existing_ids = set()
+
+    while True:
+        page = (
+            db()
+            .table("daily_news")
+            .select("finnhub_id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+            or []
+        )
+        existing_ids.update(
+            str(row["finnhub_id"]).strip()
+            for row in page
+            if row.get("finnhub_id") is not None
+            and str(row["finnhub_id"]).strip()
+        )
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return existing_ids
+
+def daily_news_delete_options():
+    page_size = 1000
+    offset = 0
+    options = []
+
+    while True:
+        page = (
+            db()
+            .table("daily_news")
+            .select("id,source")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+            or []
+        )
+        options.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+
+    return options
+
+def prepare_daily_news(records, existing_ids):
+    seen_ids = {str(article_id).strip() for article_id in existing_ids}
+    unique_records = []
+    excluded_source_count = 0
+    duplicate_count = 0
+    missing_id_count = 0
+
+    for article in records:
+        source = "".join(str(article.get("source") or "").casefold().split())
+        if "reuters" in source or "globalnewswire" in source:
+            excluded_source_count += 1
+            continue
+
+        article_id = article.get("finnhub_id")
+        if article_id is None or not str(article_id).strip():
+            missing_id_count += 1
+            continue
+
+        article_id = str(article_id).strip()
+        if article_id in seen_ids:
+            duplicate_count += 1
+            continue
+
+        seen_ids.add(article_id)
+        unique_records.append(article)
+
+    return unique_records, excluded_source_count, duplicate_count, missing_id_count
 
 def show_refresh_error(error_text, api_key):
     details = safe_error_details(error_text, api_key)
@@ -1982,7 +2063,7 @@ h1,h2,h3 { color:#1f4d72!important; }
 div[data-testid=stMetric] { background:#fff; border:1px solid #d5e1ea; border-radius:10px; padding:12px; }
 [data-baseweb=input] input, [data-baseweb=textarea] textarea { background:#fff!important; color:#18212f!important; -webkit-text-fill-color:#18212f!important; }
 [data-baseweb=input], [data-baseweb=textarea], [data-baseweb=select] > div, [data-baseweb=select] { background:#fff!important; border-color:#a9cddd!important; }
-[data-baseweb=popover], [role=listbox], [data-testid=stDateInput] div, [data-testid=stNumberInput] div { background:#fff!important; color:#18212f!important; }
+[data-baseweb=popover[role=listbox], [data-testid=stDateInput] div, [data-testid=stNumberInput] div { background:#fff!important; color:#18212f!important; }
 [data-testid=stDataFrame], [data-testid=stDataEditor], [data-testid=stExpander] { background:#fff!important; border:1px solid #c7dfeb; border-radius:10px; }
 [data-testid=stAlert] { background:#edf8ff!important; color:#18212f!important; }
 [data-testid=stProgress] > div > div { background:#1976a8!important; }
@@ -2020,68 +2101,351 @@ require_login()
 st.title("BudasAI · Admin")
 st.caption("Manage indices, daily prices, and research publishing from one private workspace.")
 page=st.sidebar.radio("Admin area",["Overview","Market indices","Price history","Articles & sources","Daily News"])
-st.sidebar.markdown('<div class="sidebar-version">version 26.9.1</div>', unsafe_allow_html=True)
+st.sidebar.markdown('<div class="sidebar-version">version 26.9.2</div>', unsafe_allow_html=True)
 
 if page=="Overview":
     m,a=rows("markets"),rows("research_articles")
     x,y=st.columns(2); x.metric("Market indices",len(m)); y.metric("Research articles",len(a))
     st.markdown("**Market indices** creates, edits, hides, and removes indices. **Price history** imports inception data, runs daily/backfill updates, and corrects saved OHLCV prices. **Articles & sources** gives you a live HTML preview before publishing.")
 
-elif page=="Daily News":
+elif page == "Daily News":
     st.header("Daily News")
-    st.caption("Replace the daily snapshot with the latest general news from Finnhub.")
-    is_refreshing = st.session_state.get("daily_news_refreshing", False)
+    st.caption("Fetch general, forex, crypto, and merger news; exclude Reuters and save new articles.")
 
-    if st.button("🔄 Refresh Daily News", type="primary", disabled=is_refreshing):
+    is_refreshing = st.session_state.get(
+        "daily_news_refreshing",
+        False
+    )
+
+    if st.button(
+        "🔄 Refresh Daily News",
+        type="primary",
+        disabled=is_refreshing
+    ):
+
         st.session_state.daily_news_refreshing = True
+
         progress = st.progress(0)
         status = st.empty()
+
         api_key = secret("News_Api_Key")
+        records = []
 
         try:
-            with st.spinner("Refreshing Daily News..."):
-                today = datetime.now(timezone.utc).date()
-                today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-                tomorrow_start = today_start + timedelta(days=1)
-                existing = db().table("daily_news").select(
-                    "id", count="exact"
-                ).gte(
-                    "created_at", today_start.isoformat()
-                ).lt(
-                    "created_at", tomorrow_start.isoformat()
-                ).execute()
-                existing_count = existing.count or len(existing.data or [])
 
-                if existing_count:
+            with st.spinner(
+                "Refreshing Daily News..."
+            ):
+
+                # =========================================
+                # STEP 1 — FETCH GENERAL NEWS
+                # =========================================
+
+                status.info(
+                    "Fetching general, forex, crypto, and merger news from Finnhub..."
+                )
+
+                progress.progress(20)
+
+                all_news = fetch_daily_news(
+                    api_key
+                )
+
+                fetched_count = len(
+                    all_news
+                )
+
+                status.info(
+                    f"Received {fetched_count} articles. "
+                    "Checking saved Finnhub IDs and filtering Reuters/GlobalNewswire..."
+                )
+
+                # =========================================
+                # STEP 2 — EXCLUDE SOURCES AND DUPLICATES
+                # =========================================
+
+                existing_ids = existing_daily_news_ids()
+                (
+                    records,
+                    excluded_source_count,
+                    duplicate_count,
+                    missing_id_count,
+                ) = prepare_daily_news(all_news, existing_ids)
+
+                progress.progress(40)
+
+                status.info(
+                    f"Excluded {excluded_source_count} Reuters/GlobalNewswire articles and "
+                    f"skipped {duplicate_count} duplicate IDs. "
+                    f"Saving {len(records)} new articles..."
+                )
+
+                # =========================================
+                # STEP 3 — NO REMAINING ARTICLES
+                # =========================================
+
+                if not records:
+
                     progress.progress(100)
-                    status.success(f"Today's news is already present: {existing_count} article(s).")
-                    st.success(f"News already present for {today_start.date()}: {existing_count} article(s). No refresh was needed.")
+
+                    status.warning(
+                        "No new eligible articles were returned. "
+                        "Existing Daily News was not changed."
+                    )
+
+                    st.warning(
+                        f"Fetched {fetched_count}; excluded "
+                        f"{excluded_source_count} Reuters/GlobalNewswire articles, skipped "
+                        f"{duplicate_count} duplicate IDs and "
+                        f"{missing_id_count} articles without Finnhub IDs. "
+                        "Existing Daily News was not changed."
+                    )
+
                 else:
-                    status.info("Fetching latest news from Finnhub...")
-                    progress.progress(20)
-                    records = fetch_daily_news(api_key)
-                    status.info(f"Received {len(records)} usable news articles.")
 
-                    progress.progress(40)
-                    if not records:
-                        status.warning("Finnhub returned no usable news articles. Existing Daily News was not changed.")
-                    else:
-                        status.info("Removing existing Daily News...")
-                        progress.progress(60)
-                        db().rpc("reset_daily_news").execute()
+                    # =====================================
+                    # STEP 4 — SAVE NEW NEWS
+                    # =====================================
 
-                        status.info(f"Saving {len(records)} latest news articles...")
-                        progress.progress(80)
-                        db().table("daily_news").insert(records).execute()
+                    status.info(
+                        f"Saving {len(records)} new articles to Supabase..."
+                    )
 
-                        progress.progress(100)
-                        status.success("Daily News refreshed successfully.")
-                        st.success(f"Articles fetched: {len(records)}\n\nArticles saved: {len(records)}")
+                    progress.progress(60)
+
+                    db().table(
+                        "daily_news"
+                    ).insert(
+                        records
+                    ).execute()
+
+                    progress.progress(100)
+
+                    status.success(
+                        "Daily News refreshed successfully."
+                    )
+
+                    st.success(
+                        f"""
+Daily News updated successfully.
+
+• Finnhub articles fetched across 4 categories: {fetched_count}
+• Reuters/GlobalNewswire articles excluded: {excluded_source_count}
+• Duplicate Finnhub IDs skipped: {duplicate_count}
+• Articles without Finnhub IDs skipped: {missing_id_count}
+• New articles saved: {len(records)}
+"""
+                    )
+
         except Exception:
-            progress.progress(100 if not records else 80) if "records" in locals() else progress.progress(20)
-            show_refresh_error(traceback.format_exc(), api_key)
+
+            progress.progress(
+                100
+                if records
+                else 20
+            )
+
+            show_refresh_error(
+                traceback.format_exc(),
+                api_key
+            )
+
         finally:
+
             st.session_state.daily_news_refreshing = False
+
+    st.subheader("Manage saved news")
+    try:
+        delete_options = daily_news_delete_options()
+    except Exception as error:
+        delete_options = []
+        st.error(f"Could not load saved news options: {error}")
+
+    source_options = sorted(
+        {
+            str(article["source"])
+            for article in delete_options
+            if article.get("source") is not None
+        },
+        key=str.casefold,
+    )
+    database_id_options = list(
+        dict.fromkeys(
+            article["id"]
+            for article in delete_options
+            if article.get("id") is not None
+        )
+    )
+
+    delete_by_date, delete_by_source, delete_by_id, reassign_ids = st.tabs(
+        [
+            "Delete before date",
+            "Delete by source",
+            "Delete by database ID",
+            "Reassign IDs",
+        ]
+    )
+
+    with delete_by_date:
+        cutoff_date = st.date_input(
+            "Delete articles published before",
+            value=date.today(),
+            key="news_delete_cutoff_date",
+        )
+        st.caption(
+            "Articles dated before midnight UTC on this date will be deleted."
+        )
+        confirm_date_delete = st.checkbox(
+            "I understand this permanently deletes matching articles.",
+            key="news_confirm_date_delete",
+        )
+        if st.button(
+            "Delete older news",
+            type="primary",
+            key="news_delete_before_date_button",
+        ):
+            if not confirm_date_delete:
+                st.warning("Confirm the deletion before continuing.")
+            else:
+                cutoff = datetime.combine(
+                    cutoff_date,
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                ).isoformat()
+                try:
+                    matching = (
+                        db()
+                        .table("daily_news")
+                        .select("id", count="exact")
+                        .lt("published_at", cutoff)
+                        .execute()
+                    )
+                    match_count = matching.count
+                    if match_count is None:
+                        match_count = len(matching.data or [])
+
+                    if match_count:
+                        db().table("daily_news").delete().lt(
+                            "published_at", cutoff
+                        ).execute()
+                        st.success(f"Deleted {match_count} older news articles.")
+                    else:
+                        st.info("No news articles matched that date.")
+                except Exception as error:
+                    st.error(f"Could not delete older news: {error}")
+
+    with delete_by_source:
+        if not source_options:
+            st.info("No saved news sources are available to delete.")
+        else:
+            if st.session_state.get("news_delete_source") not in source_options:
+                st.session_state.news_delete_source = source_options[0]
+            selected_source = st.selectbox(
+                "Source",
+                source_options,
+                key="news_delete_source",
+            )
+            confirm_source_delete = st.checkbox(
+                "I understand this deletes every article from the selected source.",
+                key="news_confirm_source_delete",
+            )
+            if st.button(
+                "Delete source news",
+                type="primary",
+                key="news_delete_source_button",
+            ):
+                if not confirm_source_delete:
+                    st.warning("Confirm the deletion before continuing.")
+                elif selected_source not in source_options:
+                    st.error("Select a valid news source.")
+                else:
+                    try:
+                        matching = (
+                            db()
+                            .table("daily_news")
+                            .select("id", count="exact")
+                            .eq("source", selected_source)
+                            .execute()
+                        )
+                        match_count = matching.count
+                        if match_count is None:
+                            match_count = len(matching.data or [])
+
+                        if match_count:
+                            db().table("daily_news").delete().eq(
+                                "source", selected_source
+                            ).execute()
+                            st.success(
+                                f"Deleted {match_count} article(s) from {selected_source}."
+                            )
+                        else:
+                            st.info("No articles from that source remain.")
+                    except Exception as error:
+                        st.error(f"Could not delete source news: {error}")
+
+    with delete_by_id:
+        if not database_id_options:
+            st.info("No saved database IDs are available to delete.")
+        else:
+            if st.session_state.get("news_delete_database_id") not in database_id_options:
+                st.session_state.news_delete_database_id = database_id_options[0]
+            selected_database_id = st.selectbox(
+                "Database row ID",
+                database_id_options,
+                format_func=str,
+                key="news_delete_database_id",
+            )
+            confirm_id_delete = st.checkbox(
+                "I understand this permanently deletes the selected row.",
+                key="news_confirm_database_id_delete",
+            )
+            if st.button(
+                "Delete selected row",
+                type="primary",
+                key="news_delete_database_id_button",
+            ):
+                if not confirm_id_delete:
+                    st.warning("Confirm the deletion before continuing.")
+                elif selected_database_id not in database_id_options:
+                    st.error("Select a valid database row ID.")
+                else:
+                    try:
+                        db().table("daily_news").delete().eq(
+                            "id", selected_database_id
+                        ).execute()
+                        st.success(
+                            f"Deleted news database row {selected_database_id}."
+                        )
+                    except Exception as error:
+                        st.error(f"Could not delete that database row: {error}")
+
+    with reassign_ids:
+        st.caption("The newest article receives ID 1; older articles receive increasing IDs.")
+        st.warning(
+            "This changes primary keys and may affect other tables that reference news IDs."
+        )
+        confirm_reassign_ids = st.checkbox(
+            "I understand this changes every news database ID.",
+            key="news_confirm_reassign_ids",
+        )
+        if st.button(
+            "Reassign all news IDs",
+            type="primary",
+            key="news_reassign_ids_button",
+        ):
+            if not confirm_reassign_ids:
+                st.warning("Confirm the ID reassignment before continuing.")
+            else:
+                try:
+                    result = db().rpc("resequence_daily_news_ids").execute()
+                    st.success(
+                        f"Reassigned IDs for {result.data or 0} news articles."
+                    )
+                except Exception as error:
+                    st.error(
+                        "Could not reassign IDs. Run the updated setup.sql in "
+                        f"Supabase first. Details: {error}"
+                    )
 
 elif page=="Market indices":
     st.header("Market indices")
