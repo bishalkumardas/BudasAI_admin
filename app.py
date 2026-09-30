@@ -359,6 +359,1493 @@ def bulk_fetch_daily_prices(markets_df, idc, tc, selected_date):
 
     return missing_rows, close
 
+def fill_missing_market_dates(
+    markets_df,
+    idc,
+    tc,
+    nc,
+    target_dates,
+    existing_dates=None,
+    mode="all"
+):
+    """
+    Fill missing market_history records.
+
+    mode="all":
+        Fill every missing ticker/date combination.
+
+    mode="all_tickers":
+        Fill only dates where ALL tickers are missing.
+
+    Returns a report dictionary.
+    """
+
+    target_dates = sorted(
+        pd.to_datetime(list(target_dates)).date.tolist()
+    )
+
+    if not target_dates:
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "remaining": 0,
+            "failed": 0,
+            "failures": [],
+        }
+
+    if existing_dates is None:
+        existing_dates = {}
+
+    progress = st.progress(0)
+    status = st.empty()
+    activity = st.empty()
+
+    # -----------------------------------------
+    # Build ticker list
+    # -----------------------------------------
+
+    market_rows = []
+
+    for _, row in markets_df.iterrows():
+
+        market_id = str(row[idc])
+
+        symbol = str(
+            row.get(tc, "")
+        ).strip()
+
+        if not symbol or symbol.lower() == "nan":
+            symbol = str(
+                row.get(nc, "")
+            ).strip()
+
+        if not symbol or symbol.lower() == "nan":
+            continue
+
+        market_rows.append({
+            "market_id": market_id,
+            "symbol": symbol,
+        })
+
+    if not market_rows:
+        st.error("No valid market tickers were found.")
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "remaining": 0,
+            "failed": 0,
+            "failures": [],
+        }
+
+    # -----------------------------------------
+    # Determine exactly what is missing
+    # -----------------------------------------
+
+    missing_pairs = []
+
+    for target in target_dates:
+
+        for market in market_rows:
+
+            market_id = market["market_id"]
+            symbol = market["symbol"]
+
+            already_exists = (
+                target in existing_dates.get(
+                    market_id,
+                    set()
+                )
+            )
+
+            if not already_exists:
+
+                missing_pairs.append({
+                    "date": target,
+                    "market_id": market_id,
+                    "symbol": symbol,
+                })
+
+    # -----------------------------------------
+    # ALL-TICKERS MODE
+    # Only dates where every ticker is missing
+    # -----------------------------------------
+
+    if mode == "all_tickers":
+
+        total_markets = len(market_rows)
+
+        missing_by_date = {}
+
+        for item in missing_pairs:
+
+            missing_by_date.setdefault(
+                item["date"],
+                []
+            ).append(item)
+
+        allowed_dates = []
+
+        for target in target_dates:
+
+            missing_count = len(
+                missing_by_date.get(target, [])
+            )
+
+            if missing_count == total_markets:
+                allowed_dates.append(target)
+
+        missing_pairs = [
+            item
+            for item in missing_pairs
+            if item["date"] in allowed_dates
+        ]
+
+    # -----------------------------------------
+    # Nothing to fill
+    # -----------------------------------------
+
+    if not missing_pairs:
+
+        progress.progress(100)
+
+        status.success(
+            "Nothing to fill. No missing records matched this option."
+        )
+
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "remaining": 0,
+            "failed": 0,
+            "failures": [],
+        }
+
+    # -----------------------------------------
+    # Group missing records by date
+    # -----------------------------------------
+
+    dates_to_process = sorted(
+        set(item["date"] for item in missing_pairs)
+    )
+
+    records_to_save = []
+
+    failures = []
+
+    attempted = len(missing_pairs)
+
+    # -----------------------------------------
+    # FETCH EACH DATE
+    # -----------------------------------------
+
+    for index, target in enumerate(
+        dates_to_process,
+        start=1
+    ):
+
+        percent = int(
+            ((index - 1) / len(dates_to_process)) * 90
+        )
+
+        progress.progress(percent)
+
+        status.info(
+            f"Processing {index}/{len(dates_to_process)} · {target}"
+        )
+
+        date_items = [
+            item
+            for item in missing_pairs
+            if item["date"] == target
+        ]
+
+        symbols = [
+            item["symbol"]
+            for item in date_items
+        ]
+
+        date_start = target.strftime("%Y-%m-%d")
+
+        date_end = (
+            target + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+
+        activity.write(
+            f"🌐 Fetching {len(symbols)} ticker(s) for {target}..."
+        )
+
+        # -----------------------------------------
+        # Yahoo Finance request
+        # -----------------------------------------
+
+        try:
+
+            data = yf.download(
+                symbols,
+                start=date_start,
+                end=date_end,
+                progress=False,
+                threads=True,
+                auto_adjust=False,
+                group_by="column",
+            )
+
+        except Exception as e:
+
+            error_message = str(e)
+
+            for item in date_items:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": item["symbol"],
+                    "error": error_message,
+                })
+
+            continue
+
+        if data.empty:
+
+            for item in date_items:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": item["symbol"],
+                    "error": "Yahoo Finance returned no data.",
+                })
+
+            continue
+
+        # -----------------------------------------
+        # Extract Close
+        # -----------------------------------------
+
+        try:
+
+            if isinstance(
+                data.columns,
+                pd.MultiIndex
+            ):
+
+                close = data["Close"]
+
+            else:
+
+                if "Close" in data.columns:
+
+                    close = data[["Close"]].copy()
+
+                    close.columns = [
+                        symbols[0]
+                    ]
+
+                else:
+
+                    close = pd.DataFrame()
+
+        except Exception as e:
+
+            for item in date_items:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": item["symbol"],
+                    "error": f"Could not extract Close price: {e}",
+                })
+
+            continue
+
+        # -----------------------------------------
+        # Extract individual prices
+        # -----------------------------------------
+
+        for item in date_items:
+
+            market_id = item["market_id"]
+            symbol = item["symbol"]
+
+            if symbol not in close.columns:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": symbol,
+                    "error": "Ticker was not returned by Yahoo Finance.",
+                })
+
+                continue
+
+            try:
+
+                price = close[symbol]
+
+                if isinstance(price, pd.DataFrame):
+                    price = price.iloc[:, 0]
+
+                price.index = pd.to_datetime(
+                    price.index
+                ).tz_localize(None)
+
+                selected = price[
+                    price.index.normalize()
+                    == pd.Timestamp(target).normalize()
+                ].dropna()
+
+                if selected.empty:
+
+                    failures.append({
+                        "date": str(target),
+                        "ticker": symbol,
+                        "error": "No trading price available for this date.",
+                    })
+
+                    continue
+
+                close_value = float(
+                    selected.iloc[0]
+                )
+
+                records_to_save.append({
+                    "market_id": market_id,
+                    "timestamp": iso(target),
+                    "value": close_value,
+                    "volume": 0,
+                })
+
+            except Exception as e:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": symbol,
+                    "error": str(e),
+                })
+
+    # -----------------------------------------
+    # INSERT INTO SUPABASE
+    # -----------------------------------------
+
+    inserted = 0
+
+    if records_to_save:
+
+        status.info(
+            f"Saving {len(records_to_save)} records to Supabase..."
+        )
+
+        activity.write(
+            f"💾 Inserting {len(records_to_save)} recovered records..."
+        )
+
+        try:
+
+            # Use chunks so one very large request
+            # does not fail unnecessarily.
+
+            chunk_size = 500
+
+            for start in range(
+                0,
+                len(records_to_save),
+                chunk_size
+            ):
+
+                chunk = records_to_save[
+                    start:start + chunk_size
+                ]
+
+                db().table(
+                    "market_history"
+                ).upsert(
+                    chunk,
+                    on_conflict="market_id,timestamp"
+                ).execute()
+
+                inserted += len(chunk)
+
+                progress.progress(
+                    min(
+                        98,
+                        90 + int(
+                            (
+                                inserted
+                                / len(records_to_save)
+                            ) * 8
+                        )
+                    )
+                )
+
+        except Exception as e:
+
+            # Database insertion itself failed.
+            failures.append({
+                "date": "DATABASE",
+                "ticker": "DATABASE",
+                "error": f"Supabase insert failed: {e}",
+            })
+
+    # -----------------------------------------
+    # VERIFY DATABASE
+    # -----------------------------------------
+
+    status.info(
+        "Verifying saved records..."
+    )
+
+    activity.write(
+        "🔍 Checking Supabase for remaining missing records..."
+    )
+
+    # Re-read the affected date range from Supabase
+    # to determine what is STILL missing.
+
+    remaining = []
+
+    try:
+
+        start_date = min(
+            dates_to_process
+        )
+
+        end_date = max(
+            dates_to_process
+        )
+
+        history = (
+            db()
+            .table("market_history")
+            .select("market_id,timestamp,value")
+            .gte(
+                "timestamp",
+                f"{start_date.isoformat()}T00:00:00+00:00"
+            )
+            .lt(
+                "timestamp",
+                f"{(end_date + timedelta(days=1)).isoformat()}T00:00:00+00:00"
+            )
+            .execute()
+            .data
+        )
+
+        saved_df = pd.DataFrame(history)
+
+        saved_dates = {}
+
+        if not saved_df.empty:
+
+            saved_df["market_id"] = (
+                saved_df["market_id"]
+                .astype(str)
+            )
+
+            saved_df["date_key"] = (
+                pd.to_datetime(
+                    saved_df["timestamp"]
+                )
+                .dt.tz_localize(None)
+                .dt.date
+            )
+
+            saved_df = saved_df[
+                saved_df["value"].notna()
+            ]
+
+            saved_dates = (
+                saved_df
+                .groupby("market_id")["date_key"]
+                .apply(set)
+                .to_dict()
+            )
+
+        for item in missing_pairs:
+
+            target = item["date"]
+            market_id = item["market_id"]
+            symbol = item["symbol"]
+
+            if target not in saved_dates.get(
+                market_id,
+                set()
+            ):
+
+                remaining.append({
+                    "date": str(target),
+                    "ticker": symbol,
+                    "market_id": market_id,
+                })
+
+    except Exception as e:
+
+        failures.append({
+            "date": "VERIFICATION",
+            "ticker": "DATABASE",
+            "error": f"Could not verify Supabase records: {e}",
+        })
+
+    progress.progress(100)
+
+    # -----------------------------------------
+    # FINAL REPORT
+    # -----------------------------------------
+
+    status.success(
+        "Gap filling completed."
+    )
+
+    st.success(
+        f"""
+        Gap filling completed.
+
+        • Missing records identified: {attempted}
+        • Records successfully saved: {inserted}
+        • Records still missing: {len(remaining)}
+        • Failed records: {len(failures)}
+        """
+    )
+
+    if remaining:
+
+        st.warning(
+            f"⚠️ {len(remaining)} records are still missing."
+        )
+
+        st.markdown(
+            "### Remaining missing records"
+        )
+
+        st.dataframe(
+            pd.DataFrame(remaining),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if failures:
+
+        st.markdown(
+            "### Errors / skipped records"
+        )
+
+        st.dataframe(
+            pd.DataFrame(failures),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    return {
+        "attempted": attempted,
+        "inserted": inserted,
+        "remaining": len(remaining),
+        "failed": len(failures),
+        "failures": failures,
+    }
+
+
+def scan_market_gaps(markets_df, idc, tc, nc, start_date, end_date):
+    """Scan market_history and return all missing market/date combinations."""
+
+    active_days = []
+    current = start_date
+
+    while current <= end_date:
+        if current.weekday() < 5:
+            active_days.append(current)
+        current += timedelta(days=1)
+
+    if not active_days:
+        return {
+            "active_days": [],
+            "existing_dates": {},
+            "results": [],
+            "all_missing_dates": [],
+        }
+
+    history = (
+        db()
+        .table("market_history")
+        .select("market_id,timestamp,value")
+        .gte(
+            "timestamp",
+            f"{start_date.isoformat()}T00:00:00+00:00"
+        )
+        .lt(
+            "timestamp",
+            f"{(end_date + timedelta(days=1)).isoformat()}T00:00:00+00:00"
+        )
+        .execute()
+        .data
+    )
+
+    existing = pd.DataFrame(history)
+
+    existing_dates = {}
+
+    if not existing.empty:
+
+        existing["market_id"] = (
+            existing["market_id"]
+            .astype(str)
+        )
+
+        timestamps = pd.to_datetime(
+            existing["timestamp"],
+            utc=True,
+            errors="coerce"
+        )
+
+        existing["date_key"] = timestamps.dt.date
+
+        # Only count records that actually contain a value
+        existing = existing[
+            existing["value"].notna()
+        ]
+
+        existing_dates = (
+            existing
+            .dropna(subset=["date_key"])
+            .groupby("market_id")["date_key"]
+            .apply(set)
+            .to_dict()
+        )
+
+    # -----------------------------------------
+    # VALID MARKET ROWS
+    # -----------------------------------------
+
+    market_rows = []
+    seen_market_ids = set()
+
+    for _, row in markets_df.iterrows():
+
+        market_id = str(row[idc]).strip()
+
+        symbol = str(
+            row.get(tc, "")
+        ).strip()
+
+        if not symbol or symbol.lower() == "nan":
+            symbol = str(
+                row.get(nc, "")
+            ).strip()
+
+        if (
+            not market_id
+            or market_id.lower() == "nan"
+            or not symbol
+            or symbol.lower() == "nan"
+        ):
+            continue
+
+        # Prevent duplicate market IDs
+        if market_id in seen_market_ids:
+            continue
+
+        seen_market_ids.add(market_id)
+
+        market_rows.append({
+            "market_id": market_id,
+            "symbol": symbol,
+            "name": str(row.get(nc, "")),
+        })
+
+    results = []
+    all_missing_dates = []
+
+    # -----------------------------------------
+    # FIND MISSING DATA
+    # -----------------------------------------
+
+    for market in market_rows:
+
+        market_id = market["market_id"]
+        symbol = market["symbol"]
+        name = market["name"]
+
+        missing_dates = []
+
+        for d in active_days:
+
+            if d not in existing_dates.get(
+                market_id,
+                set()
+            ):
+                missing_dates.append(
+                    d.isoformat()
+                )
+
+        if missing_dates:
+
+            results.append({
+                "ticker": symbol,
+                "index_name": name,
+                "count": len(missing_dates),
+                "missing_dates": ", ".join(missing_dates),
+            })
+
+    # -----------------------------------------
+    # DATES WHERE ALL TICKERS ARE MISSING
+    # -----------------------------------------
+
+    for d in active_days:
+
+        missing_for_date = []
+
+        for market in market_rows:
+
+            market_id = market["market_id"]
+            symbol = market["symbol"]
+
+            if d not in existing_dates.get(
+                market_id,
+                set()
+            ):
+                missing_for_date.append(symbol)
+
+        if (
+            len(missing_for_date) == len(market_rows)
+            and len(market_rows) > 0
+        ):
+
+            all_missing_dates.append({
+                "date": d.isoformat(),
+                "count": len(missing_for_date),
+                "missing_tickers": ", ".join(
+                    missing_for_date
+                ),
+            })
+
+    return {
+        "active_days": active_days,
+        "existing_dates": existing_dates,
+        "results": results,
+        "all_missing_dates": all_missing_dates,
+    }
+
+
+def _extract_close_dataframe(data):
+    """Safely extract Close prices from any yfinance column layout."""
+
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    try:
+
+        if isinstance(
+            data.columns,
+            pd.MultiIndex
+        ):
+
+            close = None
+
+            # Find which MultiIndex level contains "Close"
+            for level in range(
+                data.columns.nlevels
+            ):
+
+                values = list(
+                    data.columns.get_level_values(level)
+                )
+
+                if "Close" in values:
+
+                    close = data.xs(
+                        "Close",
+                        axis=1,
+                        level=level
+                    )
+
+                    break
+
+            if close is None:
+                return pd.DataFrame()
+
+        else:
+
+            if "Close" not in data.columns:
+                return pd.DataFrame()
+
+            close = data[["Close"]].copy()
+
+            # Single ticker
+            close.columns = [
+                "__single__"
+            ]
+
+        if isinstance(
+            close,
+            pd.Series
+        ):
+            close = close.to_frame()
+
+        close.columns = [
+            str(c).strip()
+            for c in close.columns
+        ]
+
+        index = pd.to_datetime(
+            close.index,
+            errors="coerce"
+        )
+
+        if getattr(index, "tz", None) is not None:
+            index = index.tz_convert(None)
+
+        close.index = index
+
+        return close
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def fill_missing_market_dates(
+    markets_df,
+    idc,
+    tc,
+    nc,
+    target_dates,
+    mode="all"
+):
+    """
+    mode="all":
+        Fill every missing ticker/date combination.
+
+    mode="all_tickers":
+        Fill only dates where ALL tickers are missing.
+    """
+
+    target_dates = sorted({
+        pd.Timestamp(d).date()
+        for d in target_dates
+        if pd.Timestamp(d).weekday() < 5
+    })
+
+    if not target_dates:
+
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "remaining": 0,
+            "failed": 0,
+            "failures": [],
+        }
+
+    progress = st.progress(0)
+    status = st.empty()
+    activity = st.empty()
+
+    # =========================================
+    # BUILD MARKET LIST
+    # =========================================
+
+    market_rows = []
+    seen_market_ids = set()
+
+    for _, row in markets_df.iterrows():
+
+        market_id = str(
+            row[idc]
+        ).strip()
+
+        symbol = str(
+            row.get(tc, "")
+        ).strip()
+
+        if not symbol or symbol.lower() == "nan":
+
+            symbol = str(
+                row.get(nc, "")
+            ).strip()
+
+        if (
+            not market_id
+            or market_id.lower() == "nan"
+            or not symbol
+            or symbol.lower() == "nan"
+        ):
+            continue
+
+        if market_id in seen_market_ids:
+            continue
+
+        seen_market_ids.add(market_id)
+
+        market_rows.append({
+            "market_id": market_id,
+            "symbol": symbol,
+        })
+
+    if not market_rows:
+
+        st.error("No valid market tickers were found.")
+
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "remaining": 0,
+            "failed": 0,
+            "failures": [],
+        }
+
+    # =========================================
+    # IMPORTANT:
+    # READ DATABASE AGAIN
+    #
+    # Do NOT trust the old scan result.
+    # =========================================
+
+    try:
+
+        db_history = (
+            db()
+            .table("market_history")
+            .select("market_id,timestamp,value")
+            .gte(
+                "timestamp",
+                f"{min(target_dates).isoformat()}T00:00:00+00:00"
+            )
+            .lt(
+                "timestamp",
+                f"{(max(target_dates) + timedelta(days=1)).isoformat()}T00:00:00+00:00"
+            )
+            .execute()
+            .data
+        )
+
+    except Exception as e:
+
+        logger.error(
+            "Gap filler database read failed:\n%s",
+            traceback.format_exc()
+        )
+
+        st.error(
+            f"Could not read market_history from Supabase: {e}"
+        )
+
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "remaining": 0,
+            "failed": 1,
+            "failures": [{
+                "date": "DATABASE",
+                "ticker": "DATABASE",
+                "error": str(e),
+            }],
+        }
+
+    existing_df = pd.DataFrame(
+        db_history
+    )
+
+    existing_dates = {}
+
+    if not existing_df.empty:
+
+        existing_df["market_id"] = (
+            existing_df["market_id"]
+            .astype(str)
+        )
+
+        existing_df["date_key"] = (
+            pd.to_datetime(
+                existing_df["timestamp"],
+                utc=True,
+                errors="coerce"
+            ).dt.date
+        )
+
+        existing_df = existing_df[
+            existing_df["value"].notna()
+        ]
+
+        existing_dates = (
+            existing_df
+            .dropna(subset=["date_key"])
+            .groupby("market_id")["date_key"]
+            .apply(set)
+            .to_dict()
+        )
+
+    # =========================================
+    # DETERMINE EXACT MISSING RECORDS
+    # =========================================
+
+    missing_pairs = []
+
+    for target in target_dates:
+
+        for market in market_rows:
+
+            market_id = market["market_id"]
+            symbol = market["symbol"]
+
+            if target not in existing_dates.get(
+                market_id,
+                set()
+            ):
+
+                missing_pairs.append({
+                    "date": target,
+                    "market_id": market_id,
+                    "symbol": symbol,
+                })
+
+    # =========================================
+    # OPTION 1:
+    # ONLY DATES WHERE ALL TICKERS ARE MISSING
+    # =========================================
+
+    if mode == "all_tickers":
+
+        total_markets = len(
+            market_rows
+        )
+
+        missing_by_date = {}
+
+        for item in missing_pairs:
+
+            missing_by_date.setdefault(
+                item["date"],
+                []
+            ).append(item)
+
+        allowed_dates = []
+
+        for target in target_dates:
+
+            if len(
+                missing_by_date.get(
+                    target,
+                    []
+                )
+            ) == total_markets:
+
+                allowed_dates.append(
+                    target
+                )
+
+        missing_pairs = [
+            item
+            for item in missing_pairs
+            if item["date"] in allowed_dates
+        ]
+
+    # =========================================
+    # NOTHING TO FILL
+    # =========================================
+
+    if not missing_pairs:
+
+        progress.progress(100)
+
+        status.success(
+            "Nothing to fill."
+        )
+
+        return {
+            "attempted": 0,
+            "inserted": 0,
+            "remaining": 0,
+            "failed": 0,
+            "failures": [],
+        }
+
+    attempted = len(
+        missing_pairs
+    )
+
+    dates_to_process = sorted({
+        item["date"]
+        for item in missing_pairs
+    })
+
+    inserted = 0
+    failures = []
+
+    # =========================================
+    # PROCESS EACH DATE
+    # =========================================
+
+    for date_number, target in enumerate(
+        dates_to_process,
+        start=1
+    ):
+
+        progress.progress(
+            int(
+                ((date_number - 1)
+                / len(dates_to_process))
+                * 90
+            )
+        )
+
+        status.info(
+            f"Processing {date_number}/"
+            f"{len(dates_to_process)} · {target}"
+        )
+
+        date_items = [
+            item
+            for item in missing_pairs
+            if item["date"] == target
+        ]
+
+        symbols = list(dict.fromkeys(
+            item["symbol"]
+            for item in date_items
+        ))
+
+        date_start = target.strftime(
+            "%Y-%m-%d"
+        )
+
+        date_end = (
+            target + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+
+        activity.write(
+            f"🌐 Fetching {len(symbols)} ticker(s) "
+            f"for {target}..."
+        )
+
+        # =====================================
+        # YAHOO DOWNLOAD
+        # =====================================
+
+        try:
+
+            data = yf.download(
+                symbols,
+                start=date_start,
+                end=date_end,
+                progress=False,
+                threads=True,
+                auto_adjust=False,
+                group_by="column",
+            )
+
+        except Exception as e:
+
+            error_message = str(e)
+
+            logger.error(
+                "Yahoo Finance failed for %s:\n%s",
+                target,
+                traceback.format_exc()
+            )
+
+            for item in date_items:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": item["symbol"],
+                    "error": error_message,
+                })
+
+            continue
+
+        if data is None or data.empty:
+
+            for item in date_items:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": item["symbol"],
+                    "error": (
+                        "Yahoo Finance returned "
+                        "no data."
+                    ),
+                })
+
+            continue
+
+        # =====================================
+        # EXTRACT CLOSE
+        # =====================================
+
+        close = _extract_close_dataframe(
+            data
+        )
+
+        if close.empty:
+
+            for item in date_items:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": item["symbol"],
+                    "error": (
+                        "Could not extract Close "
+                        "price from Yahoo Finance."
+                    ),
+                })
+
+            continue
+
+        # =====================================
+        # EXTRACT EACH TICKER
+        # =====================================
+
+        date_records = []
+        date_pairs = []
+
+        for item in date_items:
+
+            market_id = item["market_id"]
+            symbol = item["symbol"]
+
+            if symbol not in close.columns:
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": symbol,
+                    "error": (
+                        "Ticker was not returned "
+                        "by Yahoo Finance."
+                    ),
+                })
+
+                continue
+
+            try:
+
+                price = close[symbol]
+
+                if isinstance(
+                    price,
+                    pd.DataFrame
+                ):
+                    price = price.iloc[:, 0]
+
+                selected = price[
+                    price.index.normalize()
+                    == pd.Timestamp(
+                        target
+                    ).normalize()
+                ].dropna()
+
+                if selected.empty:
+
+                    failures.append({
+                        "date": str(target),
+                        "ticker": symbol,
+                        "error": (
+                            "No trading price available "
+                            "for this date."
+                        ),
+                    })
+
+                    continue
+
+                close_value = float(
+                    selected.iloc[0]
+                )
+
+                date_records.append({
+                    "market_id": market_id,
+                    "timestamp": iso(target),
+                    "value": close_value,
+                    "volume": 0,
+                })
+
+                date_pairs.append(
+                    (market_id, symbol)
+                )
+
+            except Exception as e:
+
+                logger.error(
+                    "Price extraction failed for %s %s:\n%s",
+                    target,
+                    symbol,
+                    traceback.format_exc()
+                )
+
+                failures.append({
+                    "date": str(target),
+                    "ticker": symbol,
+                    "error": str(e),
+                })
+
+        # =====================================
+        # SAVE THIS DATE IMMEDIATELY
+        # =====================================
+
+        if date_records:
+
+            activity.write(
+                f"💾 Saving {len(date_records)} "
+                f"record(s) for {target}..."
+            )
+
+            try:
+
+                db().table(
+                    "market_history"
+                ).upsert(
+                    date_records,
+                    on_conflict="market_id,timestamp"
+                ).execute()
+
+                inserted += len(
+                    date_records
+                )
+
+                # Update local state
+                for market_id, _ in date_pairs:
+
+                    existing_dates.setdefault(
+                        market_id,
+                        set()
+                    ).add(target)
+
+            except Exception as e:
+
+                logger.error(
+                    "Supabase insert failed for %s:\n%s",
+                    target,
+                    traceback.format_exc()
+                )
+
+                for market_id, symbol in date_pairs:
+
+                    failures.append({
+                        "date": str(target),
+                        "ticker": symbol,
+                        "error": (
+                            f"Supabase insert failed: {e}"
+                        ),
+                    })
+
+        progress.progress(
+            min(
+                98,
+                int(
+                    (
+                        date_number
+                        / len(dates_to_process)
+                    ) * 90
+                )
+            )
+        )
+
+    # =========================================
+    # VERIFY DATABASE
+    # =========================================
+
+    status.info(
+        "Verifying database..."
+    )
+
+    activity.write(
+        "🔍 Checking Supabase for remaining records..."
+    )
+
+    remaining = []
+
+    try:
+
+        verify_history = (
+            db()
+            .table("market_history")
+            .select(
+                "market_id,timestamp,value"
+            )
+            .gte(
+                "timestamp",
+                f"{min(target_dates).isoformat()}T00:00:00+00:00"
+            )
+            .lt(
+                "timestamp",
+                f"{(max(target_dates) + timedelta(days=1)).isoformat()}T00:00:00+00:00"
+            )
+            .execute()
+            .data
+        )
+
+        verify_df = pd.DataFrame(
+            verify_history
+        )
+
+        verified_dates = {}
+
+        if not verify_df.empty:
+
+            verify_df["market_id"] = (
+                verify_df["market_id"]
+                .astype(str)
+            )
+
+            verify_df["date_key"] = (
+                pd.to_datetime(
+                    verify_df["timestamp"],
+                    utc=True,
+                    errors="coerce"
+                ).dt.date
+            )
+
+            verify_df = verify_df[
+                verify_df["value"].notna()
+            ]
+
+            verified_dates = (
+                verify_df
+                .dropna(subset=["date_key"])
+                .groupby("market_id")["date_key"]
+                .apply(set)
+                .to_dict()
+            )
+
+        # Check ONLY the records this fill operation
+        # was supposed to fill.
+        for item in missing_pairs:
+
+            if item["date"] not in verified_dates.get(
+                item["market_id"],
+                set()
+            ):
+
+                remaining.append({
+                    "date": str(
+                        item["date"]
+                    ),
+                    "ticker": item["symbol"],
+                    "market_id": item["market_id"],
+                })
+
+    except Exception as e:
+
+        logger.error(
+            "Verification failed:\n%s",
+            traceback.format_exc()
+        )
+
+        failures.append({
+            "date": "VERIFICATION",
+            "ticker": "DATABASE",
+            "error": str(e),
+        })
+
+    progress.progress(100)
+
+    # =========================================
+    # FINAL REPORT
+    # =========================================
+
+    status.success(
+        "Gap filling completed."
+    )
+
+    return {
+        "attempted": attempted,
+        "inserted": inserted,
+        "remaining": len(remaining),
+        "failed": len(failures),
+        "failures": failures,
+        "remaining_records": remaining,
+    }
+
+
 def value_text(v):
     return "" if v is None or (isinstance(v,float) and pd.isna(v)) else str(v)
 def market_extra_inputs(record, excluded):
@@ -377,6 +1864,7 @@ def market_extra_inputs(record, excluded):
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_COOKIE = "budasai_admin_session"
 LOGIN_DURATION_DAYS = 30
+APP_VERSION = "26.9.1"
 
 def login_cookies():
     return CookieController()
@@ -483,7 +1971,8 @@ def require_login():
 
     st.stop()
 
-st.markdown("""<style>
+st.markdown("""
+<style>
 .stApp, .stApp p, .stApp label, .stApp span, .stApp div { color:#18212f; }
 .stApp { background:#f8fafc; }
 .block-container { max-width:1400px; padding-top:1.7rem; }
@@ -502,11 +1991,36 @@ div[data-testid=stMetric] { background:#fff; border:1px solid #d5e1ea; border-ra
 [data-testid=stTabs] button[aria-selected=true] { color:#1f4d72!important; }
 .stButton button { background:#e8f1f7; color:#183e5a!important; border-color:#a9c5d7; }
 .stButton button[kind=primary] { background:#1f6b99; color:#fff!important; border-color:#1f6b99; }
-</style>""",unsafe_allow_html=True)
+[data-testid="stSidebarNav"] {
+  display: flex;
+  flex-direction: column;
+}
+[data-testid="stSidebarNav"] > div:last-child {
+  margin-top: auto;
+  padding-top: 0.75rem;
+}
+.sidebar-version {
+  display: block;
+  margin-top: 1rem;
+  padding: 0.45rem 0.7rem;
+  border-radius: 999px;
+  background: rgba(31, 62, 90, 0.08);
+  border: 1px solid rgba(31, 62, 90, 0.2);
+  color: #1f4d72;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: center;
+  letter-spacing: 0.02em;
+  width: 100%;
+  box-sizing: border-box;
+}
+</style>
+""",unsafe_allow_html=True)
 require_login()
 st.title("BudasAI · Admin")
 st.caption("Manage indices, daily prices, and research publishing from one private workspace.")
 page=st.sidebar.radio("Admin area",["Overview","Market indices","Price history","Articles & sources","Daily News"])
+st.sidebar.markdown('<div class="sidebar-version">version 26.9.1</div>', unsafe_allow_html=True)
 
 if page=="Overview":
     m,a=rows("markets"),rows("research_articles")
@@ -572,7 +2086,428 @@ elif page=="Daily News":
 elif page=="Market indices":
     st.header("Market indices")
     m=rows("markets"); idc=col(m,["id","market_id"]); nc=MARKET_NAME_COLUMN; tc=MARKET_SYMBOL_COLUMN; vc=col(m,["is_visible","visible","is_active","enabled"]); pc=col(m,MARKET_PRICE_COLUMNS)
-    t1,t2,t3,t4=st.tabs(["Index list","Add index","Edit / hide","Daily batch"])
+    t1,t2,t3,t4,t5=st.tabs(["Index list","Add index","Edit / hide","Daily batch","Gap filler"])
+    with t5:
+
+        if m.empty or not idc:
+
+            st.info("Add an index first.")
+
+        else:
+
+            selected_range = st.date_input(
+                "Date range",
+                value=(
+                    date.today() - timedelta(days=30),
+                    date.today()
+                ),
+                min_value=date(2000, 1, 1),
+                max_value=date.today(),
+                key="gap_date_range"
+            )
+
+            if isinstance(
+                selected_range,
+                (list, tuple)
+            ) and len(selected_range) == 2:
+
+                start_date, end_date = selected_range
+
+            else:
+
+                st.warning(
+                    "Please select a start and end date."
+                )
+                st.stop()
+
+            if start_date > end_date:
+
+                st.warning(
+                    "Start date must be before end date."
+                )
+
+            else:
+
+                # =========================================
+                # SCAN
+                # =========================================
+
+                if st.button(
+                    "🔍 Scan for missing dates",
+                    type="primary",
+                    key="gap_scan_button"
+                ):
+
+                    with st.spinner(
+                        "Scanning market_history..."
+                    ):
+
+                        try:
+
+                            scan = scan_market_gaps(
+                                m,
+                                idc,
+                                tc,
+                                nc,
+                                start_date,
+                                end_date
+                            )
+
+                            st.session_state[
+                                "gap_scan"
+                            ] = {
+                                "start_date": start_date,
+                                "end_date": end_date,
+                                **scan,
+                            }
+
+                        except Exception as e:
+
+                            logger.error(
+                                "Gap scan failed:\n%s",
+                                traceback.format_exc()
+                            )
+
+                            st.error(
+                                f"Gap scan failed: {e}"
+                            )
+
+                # =========================================
+                # LOAD LAST SCAN
+                # =========================================
+
+                scan = st.session_state.get(
+                    "gap_scan"
+                )
+
+                if scan:
+
+                    results = scan["results"]
+                    all_missing_dates = scan[
+                        "all_missing_dates"
+                    ]
+
+                    # =====================================
+                    # NORMAL MISSING DATA
+                    # =====================================
+
+                    if results:
+
+                        st.markdown(
+                            "### Missing data by ticker"
+                        )
+
+                        st.dataframe(
+                            pd.DataFrame(results)[[
+                                "ticker",
+                                "index_name",
+                                "count",
+                                "missing_dates"
+                            ]],
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                    else:
+
+                        st.success(
+                            "No missing weekday data found "
+                            "for the selected range."
+                        )
+
+                    # =====================================
+                    # ALL-TICKER MISSING DATES
+                    # =====================================
+
+                    if all_missing_dates:
+
+                        st.markdown(
+                            "### Dates missing across ALL tickers"
+                        )
+
+                        st.dataframe(
+                            pd.DataFrame(
+                                all_missing_dates
+                            )[[
+                                "date",
+                                "count",
+                                "missing_tickers"
+                            ]],
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                    # =====================================
+                    # FILL OPTIONS
+                    # =====================================
+
+                    st.markdown(
+                        "### Fill missing data"
+                    )
+
+                    col_fill_all, col_fill_every = (
+                        st.columns(2)
+                    )
+
+                    # =====================================
+                    # OPTION 1
+                    # ONLY DATES WHERE ALL TICKERS MISSING
+                    # =====================================
+
+                    with col_fill_all:
+
+                        if st.button(
+                            "Fill missing dates across all tickers",
+                            type="primary",
+                            disabled=not bool(
+                                all_missing_dates
+                            ),
+                            key="gap_fill_all_tickers"
+                        ):
+
+                            selected_dates = [
+                                date.fromisoformat(
+                                    item["date"]
+                                )
+                                for item
+                                in all_missing_dates
+                            ]
+
+                            report = (
+                                fill_missing_market_dates(
+                                    m,
+                                    idc,
+                                    tc,
+                                    nc,
+                                    selected_dates,
+                                    mode="all_tickers"
+                                )
+                            )
+
+                            st.markdown(
+                                "### Fill report"
+                            )
+
+                            a, b, c, d = st.columns(4)
+
+                            a.metric(
+                                "Missing identified",
+                                report["attempted"]
+                            )
+
+                            b.metric(
+                                "Filled",
+                                report["inserted"]
+                            )
+
+                            c.metric(
+                                "Remaining",
+                                report["remaining"]
+                            )
+
+                            d.metric(
+                                "Errors",
+                                report["failed"]
+                            )
+
+                            if report["remaining"] == 0:
+
+                                st.success(
+                                    "All selected missing "
+                                    "records were filled."
+                                )
+
+                            else:
+
+                                st.warning(
+                                    f"{report['remaining']} "
+                                    "records are still missing."
+                                )
+
+                            if report["failures"]:
+
+                                with st.expander(
+                                    "Show errors"
+                                ):
+
+                                    st.dataframe(
+                                        pd.DataFrame(
+                                            report["failures"]
+                                        ),
+                                        use_container_width=True,
+                                        hide_index=True
+                                    )
+
+                            # Re-scan immediately
+                            try:
+
+                                refreshed_scan = (
+                                    scan_market_gaps(
+                                        m,
+                                        idc,
+                                        tc,
+                                        nc,
+                                        start_date,
+                                        end_date
+                                    )
+                                )
+
+                                st.session_state[
+                                    "gap_scan"
+                                ] = {
+                                    "start_date": start_date,
+                                    "end_date": end_date,
+                                    **refreshed_scan,
+                                }
+
+                                st.success(
+                                    "Scan refreshed. "
+                                    "The tables above now reflect "
+                                    "the current database."
+                                )
+
+                            except Exception as e:
+
+                                st.error(
+                                    f"Could not refresh scan: {e}"
+                                )
+
+                    # =====================================
+                    # OPTION 2
+                    # EVERY MISSING TICKER/DATE
+                    # =====================================
+
+                    with col_fill_every:
+
+                        if st.button(
+                            "Fill all missing dates",
+                            type="primary",
+                            disabled=not bool(results),
+                            key="gap_fill_everything"
+                        ):
+
+                            selected_dates = sorted({
+                                date.fromisoformat(
+                                    missing_date
+                                )
+                                for row in results
+                                for missing_date
+                                in row[
+                                    "missing_dates"
+                                ].split(", ")
+                                if missing_date
+                            })
+
+                            report = (
+                                fill_missing_market_dates(
+                                    m,
+                                    idc,
+                                    tc,
+                                    nc,
+                                    selected_dates,
+                                    mode="all"
+                                )
+                            )
+
+                            st.markdown(
+                                "### Fill report"
+                            )
+
+                            a, b, c, d = st.columns(4)
+
+                            a.metric(
+                                "Missing identified",
+                                report["attempted"]
+                            )
+
+                            b.metric(
+                                "Filled",
+                                report["inserted"]
+                            )
+
+                            c.metric(
+                                "Remaining",
+                                report["remaining"]
+                            )
+
+                            d.metric(
+                                "Errors",
+                                report["failed"]
+                            )
+
+                            if report["remaining"] == 0:
+
+                                st.success(
+                                    "All selected missing "
+                                    "records were filled."
+                                )
+
+                            else:
+
+                                st.warning(
+                                    f"{report['remaining']} "
+                                    "records are still missing."
+                                )
+
+                            if report["failures"]:
+
+                                with st.expander(
+                                    "Show errors"
+                                ):
+
+                                    st.dataframe(
+                                        pd.DataFrame(
+                                            report["failures"]
+                                        ),
+                                        use_container_width=True,
+                                        hide_index=True
+                                    )
+
+                            # Re-scan immediately
+                            try:
+
+                                refreshed_scan = (
+                                    scan_market_gaps(
+                                        m,
+                                        idc,
+                                        tc,
+                                        nc,
+                                        start_date,
+                                        end_date
+                                    )
+                                )
+
+                                st.session_state[
+                                    "gap_scan"
+                                ] = {
+                                    "start_date": start_date,
+                                    "end_date": end_date,
+                                    **refreshed_scan,
+                                }
+
+                                st.success(
+                                    "Scan refreshed. "
+                                    "The tables above now reflect "
+                                    "the current database."
+                                )
+
+                            except Exception as e:
+
+                                st.error(
+                                    f"Could not refresh scan: {e}"
+                                )
+
+                    # =====================================
+                    # EXPLANATION
+                    # =====================================
+
+                    st.caption(
+                        "Option 1 fills only dates where every "
+                        "ticker is missing. Option 2 fills every "
+                        "missing ticker/date combination. "
+                        "Remaining records can include market holidays "
+                        "or tickers for which Yahoo Finance has no price."
+                    )
     with t1:
         st.dataframe(m,width="stretch",hide_index=True) if not m.empty else st.info("No indices yet. Add your first one below.")
     with t2:
