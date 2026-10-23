@@ -1954,7 +1954,7 @@ def market_extra_inputs(record, excluded):
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_COOKIE = "budasai_admin_session"
 LOGIN_DURATION_DAYS = 30
-APP_VERSION = "26.9.1"
+APP_VERSION = "26.10.1"
 
 def login_cookies():
     return CookieController()
@@ -2110,7 +2110,7 @@ require_login()
 st.title("BudasAI · Admin")
 st.caption("Manage indices, daily prices, and research publishing from one private workspace.")
 page=st.sidebar.radio("Admin area",["Overview","Market indices","Price history","Articles & sources","Daily News"])
-st.sidebar.markdown('<div class="sidebar-version">version 26.9.2</div>', unsafe_allow_html=True)
+st.sidebar.markdown(f'<div class="sidebar-version">version {APP_VERSION}</div>', unsafe_allow_html=True)
 
 if page=="Overview":
     m,a=rows("markets"),rows("research_articles")
