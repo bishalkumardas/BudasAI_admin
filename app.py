@@ -151,7 +151,16 @@ def prepare_daily_news(records, existing_ids):
 
     for article in records:
         source = "".join(str(article.get("source") or "").casefold().split())
-        if "reuters" in source or "globalnewswire" in source:
+        if any(
+            blocked_source in source
+            for blocked_source in (
+                "reuters",
+                "globalnewswire",
+                "cointelegraph",
+                "seekingalpha",
+                "forece",
+            )
+        ):
             excluded_source_count += 1
             continue
 
